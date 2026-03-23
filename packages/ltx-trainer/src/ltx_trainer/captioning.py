@@ -116,7 +116,8 @@ class QwenOmniCaptioner(MediaCaptioningModel):
     Model: Qwen/Qwen2.5-Omni-7B (7B parameters)
     """
 
-    MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
+    # MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
+    MODEL_ID = "/root/autodl-tmp/huggingface/models/Qwen--Qwen2.5-Omni-7B"
 
     # Default system prompt required by Qwen2.5-Omni for proper audio processing
     DEFAULT_SYSTEM_PROMPT = (
@@ -255,7 +256,7 @@ class QwenOmniCaptioner(MediaCaptioningModel):
             Qwen2_5OmniThinkerForConditionalGeneration,
         )
 
-        quantization_config = BitsAndBytesConfig(load_in_8bit=True) if use_8bit else None
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=True) if use_8bit else None
 
         # Use Thinker-only model for text generation (saves memory by not loading Talker)
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(

@@ -16,6 +16,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+import pdb
 
 import numpy as np
 import pandas as pd
@@ -545,6 +546,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
             # Save latents for each item in batch
             for i in range(len(batch["relative_path"])):
                 output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
+                # pdb.set_trace()
                 output_file = output_path / output_rel_path
 
                 # Create output directory maintaining structure

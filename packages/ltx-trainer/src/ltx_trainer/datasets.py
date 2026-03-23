@@ -1,4 +1,5 @@
 from pathlib import Path
+import pdb
 
 import torch
 from einops import rearrange
@@ -153,6 +154,7 @@ class PrecomputedDataset(Dataset):
     def _discover_samples(self) -> dict[str, list[Path]]:
         """Discover all valid sample files across all data sources."""
         # Use first data source as the reference to discover samples
+        # pdb.set_trace()
         data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
         data_path = self.source_paths[data_key]
         data_files = list(data_path.glob("**/*.pt"))

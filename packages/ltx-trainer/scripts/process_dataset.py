@@ -9,6 +9,17 @@ Basic usage:
     python scripts/process_dataset.py /path/to/dataset.json --resolution-buckets 768x768x49 \
         --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
 The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
+
+### mjh's run command 
+Example:
+uv run python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/scripts/process_dataset.py \
+[Points to Note]      /root/autodl-tmp/data/scenes_clip_official_v2_dataset_video_info.json \
+                    --resolution-buckets "1056x1920x97;640x352x65" \
+                    --model-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2/ltx-2-19b-dev.safetensors \
+                    --text-encoder-path /root/autodl-tmp/huggingface/models/google--gemma-3-12b-it-qat-q4_0-unquantized \
+                    --with-audio
+[Points to Note]    --video-column video_path
+[Points to Note]    --output-dir /root/autodl-tmp/data/.ltx2_precomputed
 """
 
 from pathlib import Path

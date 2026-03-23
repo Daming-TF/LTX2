@@ -17,11 +17,15 @@ Advanced usage:
     scenes_split.py input.mp4 output_dir/ --detector content --min-scene-length 30 --frame-skip 2
     # Use adaptive detection with custom detector and detector parameters
     scenes_split.py input.mp4 output_dir/ --detector adaptive --threshold 3.0 --adaptive-window 10
+
+### mjh's run command example:
+uv run python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/scripts/split_scenes.py /root/autodl-tmp/data/test2.mp4 /root/autodl-tmp/data/scenes_clip_official_v2 --max-frames-per-scene 100
 """
 
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Tuple
+import warnings
 
 import typer
 from scenedetect import (
@@ -37,6 +41,8 @@ from scenedetect.scene_manager import SceneDetector, write_scene_list_html
 from scenedetect.scene_manager import save_images as save_scene_images
 from scenedetect.stats_manager import StatsManager
 from scenedetect.video_splitter import split_video_ffmpeg
+
+import pdb
 
 app = typer.Typer(no_args_is_help=True, help="Split video into scenes using PySceneDetect.")
 
@@ -168,6 +174,7 @@ def detect_and_split_scenes(  # noqa: PLR0913
     downscale_factor: Optional[int] = None,
     frame_skip: int = 0,
     duration: Optional[str] = None,
+    max_frames_per_scene: Optional[int] = None, 
 ) -> List[Tuple[FrameTimecode, FrameTimecode]]:
     """Detect and split scenes in a video using the specified parameters.
     Args:
@@ -236,6 +243,26 @@ def detect_and_split_scenes(  # noqa: PLR0913
 
     # Get scene list
     scenes = scene_manager.get_scene_list()
+    # pdb.set_trace()
+
+
+    # mjh's modify: Apply max_frames_per_scene limit if specified (from start of scene)
+    if max_frames_per_scene is not None:
+        if (max_frames_per_scene-1)%8 != 0:
+            warnings.warn("max_frames_per_scene must be a multiple of 8")
+            max_frames_per_scene -= (max_frames_per_scene-1)%8
+            typer.echo(f"Adjusted max_frames_per_scene to \033[31m {max_frames_per_scene} \033[0m to be a multiple of 8")
+        adjusted_scenes = []
+        for start, end in scenes:
+            new_end_frames = min(start.get_frames() + max_frames_per_scene, end.get_frames())
+            # FrameTimecode expects a timecode, not a "frame" keyword argument.
+            new_end = FrameTimecode(timecode=new_end_frames, fps=video.frame_rate)
+            adjusted_scenes.append((start, new_end))
+        scenes = adjusted_scenes
+        # pdb.set_trace()
+        frames = max(filter_shorter_than_tc.get_frames(), max_frames_per_scene) if filter_shorter_than_tc \
+            else max_frames_per_scene
+        filter_shorter_than_tc = FrameTimecode(timecode=int(frames), fps=video.frame_rate)
 
     # Filter out scenes that are too short if filter_shorter_than is specified
     if filter_shorter_than_tc:
@@ -382,6 +409,11 @@ def main(  # noqa: PLR0913
         0,
         help="Number of frames to skip during processing",
     ),
+    # mjh's modify
+    max_frames_per_scene: Optional[int] = typer.Option(
+        None,
+        help="Maximum number of frames to keep per scene (from start). If not specified, keeps full scene.",
+    ),
 ) -> None:
     """Split video into scenes using PySceneDetect."""
     if skip_start or skip_end:
@@ -410,6 +442,8 @@ def main(  # noqa: PLR0913
         fade_bias=fade_bias,
         downscale_factor=downscale,
         frame_skip=frame_skip,
+        # mjh's modify
+        max_frames_per_scene=max_frames_per_scene,
     )
 
 

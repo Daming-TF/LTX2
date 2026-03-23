@@ -3,6 +3,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Callable
+import pdb
 
 import torch
 import wandb
@@ -578,6 +579,7 @@ class LtxvTrainer:
 
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
+        # pdb.set_trace()
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()

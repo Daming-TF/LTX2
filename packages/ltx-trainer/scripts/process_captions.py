@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+import pdb
 
 import pandas as pd
 import torch
@@ -187,8 +188,14 @@ class CaptionsDataset(Dataset):
 
             media_path = Path(entry[self.media_column].strip())
             # Convert media path to embedding output path (same structure, .pt extension)
-            output_path = str(media_path.with_suffix(".pt"))
-            caption_data[output_path] = entry[self.caption_column]
+
+            # output_path = str(media_path.with_suffix(".pt"))
+            # caption_data[output_path] = entry[self.caption_column]
+
+            # mjh's modify
+            data_root = self.dataset_file.parent
+            media_relative_path = str(media_path.relative_to(data_root).with_suffix(".pt"))
+            caption_data[media_relative_path] = entry[self.caption_column]
 
         return caption_data
 
@@ -205,8 +212,14 @@ class CaptionsDataset(Dataset):
 
                 media_path = Path(entry[self.media_column].strip())
                 # Convert media path to embedding output path (same structure, .pt extension)
-                output_path = str(media_path.with_suffix(".pt"))
-                caption_data[output_path] = entry[self.caption_column]
+
+                # output_path = str(media_path.with_suffix(".pt"))
+                # caption_data[output_path] = entry[self.caption_column]
+
+                # mjh's modify
+                data_root = self.dataset_file.parent
+                media_relative_path = str(media_path.relative_to(data_root).with_suffix(".pt"))
+                caption_data[media_relative_path] = entry[self.caption_column]
 
         return caption_data
 
@@ -317,7 +330,9 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     output_rel_path = Path(batch["output_path"][i])
 
                     # Create output directory maintaining structure
+                    # pdb.set_trace()
                     output_dir_path = output_path / output_rel_path.parent
+                    # output_dir_path = output_path
                     output_dir_path.mkdir(parents=True, exist_ok=True)
 
                     embedding_data = {
@@ -326,6 +341,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     }
 
                     output_file = output_path / output_rel_path
+                    # output_file = output_path / output_rel_path.name
                     torch.save(embedding_data, output_file)
 
             progress.advance(task)

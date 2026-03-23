@@ -10,6 +10,9 @@ Basic usage:
 For multi-GPU/FSDP training, configure and launch via Accelerate:
     accelerate config
     accelerate launch scripts/train.py CONFIG_PATH
+
+mjh's Example:
+uv run python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/scripts/train.py /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/configs/ltx2_av_lora_mjh.yaml
 """
 
 from pathlib import Path

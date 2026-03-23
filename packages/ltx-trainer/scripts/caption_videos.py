@@ -19,10 +19,14 @@ Basic usage:
 Advanced usage:
     # Use Gemini Flash API (requires GEMINI_API_KEY or GOOGLE_API_KEY env var)
     caption_videos.py videos_dir/ --captioner-type gemini_flash
-    # Disable audio processing (video-only captions)
+    # Disable audio processing (video-only captions)python 
     caption_videos.py videos_dir/ --no-audio
     # Process videos with specific extensions and save as JSON
     caption_videos.py videos_dir/ --extensions mp4,mov,avi --output captions.json
+
+### mjh's run command example:
+uv run python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/scripts/caption_videos.py  /root/autodl-tmp/data/scenes_clip_official 
+    --output /root/autodl-tmp/data/scenes_clip_official_dataset.json
 """
 
 import csv
