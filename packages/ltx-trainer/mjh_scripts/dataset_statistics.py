@@ -52,7 +52,7 @@ def extract_video_info(jsonl_file, output_file):
     print(f"\033[35m Saved video info to {output_file}\033[0m")
 
 
-def stat_reso_buckets(jsonl_file, topk=10, file_type="jsonl"):
+def stat_reso_buckets(jsonl_file, topk=10, file_type="json"):
     ds = load_dataset(file_type, data_files=jsonl_file, split='train')
     # bucket_counts = ds.to_pandas()['reso'].value_counts()
     # print(bucket_counts)
@@ -63,7 +63,7 @@ def stat_reso_buckets(jsonl_file, topk=10, file_type="jsonl"):
     for r in ds:
         reso_counter[(r['reso'],r['ori_reso'])] += 1
     for index, ((reso, ori_reso), count) in enumerate(reso_counter.most_common(topk), 1):
-        print(f"top {index}\t|\tstandard:{reso}\toriginal:{ori_reso}\tcount:{count}")
+        print(f"top {index}\t|\tstandard(w*h*t):{reso}\toriginal:{ori_reso}\tcount:{count}")
 
 
 if __name__ == "__main__":
@@ -75,4 +75,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not args.output_file: args.output_file = args.json_file.replace('.json', f'_video_info.{args.file_endswith}') 
     extract_video_info(args.json_file, args.output_file)
-    stat_reso_buckets(args.output_file, topk=args.topk, file_type=args.file_endswith)
+    stat_reso_buckets(args.output_file, topk=args.topk)
