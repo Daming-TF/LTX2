@@ -220,7 +220,6 @@ class PrecomputedDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         result = {}
-
         for dir_name, output_key in self.data_sources.items():
             source_path = self.source_paths[dir_name]
             file_rel_path = self.sample_files[output_key][index]
