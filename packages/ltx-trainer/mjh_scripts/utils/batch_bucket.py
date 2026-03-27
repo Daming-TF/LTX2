@@ -1,5 +1,13 @@
+from einops import rearrange
+import torch
 from torch.utils.data import RandomSampler, BatchSampler, Dataset, Sampler
 from typing import Iterator, Sequence
+import pdb
+from pathlib import Path
+# import sys
+# sys.path.append(str(Path(__file__).parent.parent.parent / "src"))
+# from ltx_trainer.datasets import PrecomputedDataset
+
 
 class AspectRatioBatchSampler(BatchSampler):
     def __init__(self,
@@ -54,3 +62,76 @@ class AspectRatioBatchSampler(BatchSampler):
                     if not self.drop_last:
                         yield bucket[:]
                     del bucket[:]
+
+
+def _normalize_video_latents(data: dict) -> dict:
+        """
+        Normalize video latents to non-patchified format [C, F, H, W].
+        Used for keeping backward compatibility with legacy datasets.
+        """
+        latents = data["latents"]
+
+        # Check if latents are in legacy patchified format [seq_len, C]
+        if latents.dim() == 2:
+            # Legacy format: [seq_len, C] where seq_len = F * H * W
+            num_frames = data["num_frames"]
+            height = data["height"]
+            width = data["width"]
+
+            # Unpatchify: [seq_len, C] -> [C, F, H, W]
+            latents = rearrange(
+                latents,
+                "(f h w) c -> c f h w",
+                f=num_frames,
+                h=height,
+                w=width,
+            )
+
+            # Update the data dict with unpatchified latents
+            data = data.copy()
+            data["latents"] = latents
+
+        return data
+
+
+def prepare_train_dataset(dataset, accelerator, data_sources, aspect_ratios=None):
+    def preprocess_train(examples):
+        package = {}
+        for i in range(len(examples["bucket"])):
+            for dir_name, output_key in data_sources.items():
+                try:
+                    latent_tmp = torch.load(examples[output_key][i], map_location="cpu", weights_only=True)
+                    # Normalize latent(video & audio) format if this is a latent source
+                    if "latent" in dir_name.lower(): latent_tmp = _normalize_video_latents(latent_tmp)
+                    assert isinstance(latent_tmp, dict), f"Expected loaded data to be a dict, but got {type(latent_tmp)}."
+                    for k, v in latent_tmp.items():
+                        package.setdefault(f"{dir_name[0]}_{k}", [])
+                        package[f"{dir_name[0]}_{k}"].append(v)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load {output_key} from {examples[output_key][i]}: {e}") from e
+        package['bucket'] = examples['bucket']
+        # Keep original sample indices for easier debugging after batching.
+        if 'sample_idx' in examples:
+            package['sample_idx'] = examples['sample_idx']
+        # pdb.set_trace()
+        return package
+    
+    with accelerator.main_process_first():
+        dataset = dataset.with_transform(preprocess_train)
+    return dataset
+
+
+def collate_fn(batch):
+    package = {}
+    for _batch in batch:
+        for k, v in _batch.items():
+            package.setdefault(k, [])
+            package[k].append(v)
+    for k, v in package.items():
+        if isinstance(v[0], torch.Tensor):
+            package[k] = torch.stack(v)
+        elif k == 'sample_idx':
+            package[k] = torch.tensor(v, dtype=torch.long)
+        else:
+            package[k] = v
+    return package

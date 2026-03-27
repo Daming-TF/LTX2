@@ -38,22 +38,33 @@
 
 
 
-# ######### Test dataloader
-# from torch.utils.data import DataLoader
-# import pdb
+######### Test dataloader
+from accelerate import Accelerator
+from datasets import load_dataset
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+import pdb
+from pathlib import Path
+import torch
 
-# import sys
-# sys.path.append("/root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/src")
-# from ltx_trainer.datasets import PrecomputedDataset
+import sys
+sys.path.append("/root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/src")
+from ltx_trainer.datasets import PrecomputedDataset
+sys.path.append(Path(__file__).parent.parent)
+from mjh_scripts.utils.batch_bucket import AspectRatioBatchSampler, prepare_train_dataset, collate_fn
+
+BUCKET_EXAMPLE = {
+    "1.78-97":[512,288,97],"0.55-65":[352,352,65]
+}
+num_workers = 1
+data_sources = {
+    "video_latents": "latents",
+    "conditions": "conditions",
+    "audio_latents": "audio_latents",
+}
+
+#### ori method to load dataset
 # data_root = "/root/autodl-tmp/data/.ltx2_precomputed"
-# data_sources = {
-#     "latents": "latents",
-#     "conditions": "conditions",
-#     "audio_latents": "audio_latents",
-# }
 # dataset = PrecomputedDataset(data_root, data_sources)
-# ratio_nums = dataset.to_pandas().groupby('bucket').size().to_dict()
-# num_workers = 1
 # dataloader = DataLoader(
 #     dataset,
 #     batch_size=1,
@@ -63,25 +74,44 @@
 #     pin_memory=num_workers > 0,
 #     persistent_workers=num_workers > 0,
 # )
-# for batch in dataloader:
-#     pdb.set_trace()
-#     print(batch['latents']['latents'].shape)
-# #########
+#####
+
+#### bucket method to load dataset
+accelerator = Accelerator(mixed_precision="bf16",gradient_accumulation_steps=1)
+jsonl_file = "/root/autodl-tmp/data/scenes_clip_official_v2_dataset_for_training.jsonl"
+dataset = load_dataset("json", data_files=jsonl_file, split='train')
+if "sample_idx" not in dataset.column_names:
+    dataset = dataset.add_column("sample_idx", list(range(len(dataset))))
+ratio_nums = dataset.to_pandas().groupby('bucket').size().to_dict()
+dataset = prepare_train_dataset(dataset, accelerator, data_sources, BUCKET_EXAMPLE)
+generator=torch.Generator().manual_seed(42)
+batch_sampler = AspectRatioBatchSampler(
+    sampler=RandomSampler(dataset, generator=generator), 
+    # sampler=SequentialSampler(dataset),
+    dataset=dataset,
+    batch_size=4, aspect_ratios=BUCKET_EXAMPLE, drop_last=True,
+    ratio_nums=ratio_nums, 
+    valid_num=0,
+)
+dataloader = torch.utils.data.DataLoader(
+    dataset, 
+    batch_sampler=batch_sampler, 
+    collate_fn=collate_fn
+)
+######
+
+for batch in dataloader:
+    pdb.set_trace()
+    print(batch['v_latents'].shape, batch['c_prompt_embeds'].shape, batch['a_latents'].shape)
+    print(batch['sample_idx'])
+#########
 
 
-# from datasets import load_dataset
+# import yaml
 # import pdb
-# json_file = "/root/autodl-tmp/data/scenes_clip_official_v2_dataset_video_info.jsonl"
-# dataset = load_dataset(
-#     "json",
-#     data_files=json_file,
-# )["train"]
-# ratio_nums = dataset.to_pandas().groupby('bucket').size().to_dict()
-# pdb.set_trace()
-# print("successfully load dataset")
-
-
-from pathlib import Path
-tmp = Path(__file__).parent/"test.txt"
-tmp = tmp.with_suffix('.jpg')
-print(tmp)
+# config_path = "/root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/configs/ltx2_av_lora_mjh.yaml"
+# with open(config_path, "r") as file:
+#     cfd = yaml.safe_load(file)
+# # pdb.set_trace()
+# tmp = cfd['validation']['video_dims']
+# print(type(tmp), tmp)

@@ -24,6 +24,11 @@ from rich.console import Console
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import LtxvTrainer
 
+import sys
+sys.path.append(str(Path(__file__).parent.parent))
+from mjh_scripts.utils.trainer_dev import LtxTrainerDev as LtxvTrainer
+
+
 console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,

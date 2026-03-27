@@ -755,10 +755,18 @@ class LtxvTrainer:
         output_dir = Path(self._config.output_dir) / "samples"
         output_dir.mkdir(exist_ok=True, parents=True)
 
+        # mjh's modify
         video_paths = []
-        width, height, num_frames = self._config.validation.video_dims
+        if isinstance(self._config.validation.video_dims[0], list):
+            video_dims = self._config.validation.video_dims
+            assert len(video_dims) == len(self._config.validation.prompts), "Length of validation.video_dims must match number of prompts when using per-prompt dimensions."
+        elif isinstance(self._config.validation.video_dims[0], int) and len(self._config.validation.video_dims) == 3:
+            video_dims = [self._config.validation.video_dims]*len(self._config.validation.prompts)
+        else:
+            raise ValueError("Invalid format for validation.video_dims in config. Must be either a list of [H, W, F] or a single [H, W, F] applied to all prompts.")
+        ## End of mjh's modify
 
-        for prompt_idx, prompt in enumerate(self._config.validation.prompts):
+        for prompt_idx, (prompt, (height, width, num_frames)) in enumerate(zip(self._config.validation.prompts, video_dims)):
             # Update progress to show current video
             sampling_ctx.start_video(prompt_idx)
 

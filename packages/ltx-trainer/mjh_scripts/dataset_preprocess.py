@@ -42,19 +42,19 @@ Usage:
     --topk 10
 Example:
     Mode-get_bucket:
-        uv run python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/mjh_scripts/dataset_statistics.py \
+        uv run python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/mjh_scripts/dataset_preprocess.py \
             --json_file /root/autodl-tmp/data/scenes_clip_official_v2_dataset.json
     Mode-transfer2jsonl:
         python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/mjh_scripts/dataset_preprocess.py \
             --mode transfer2jsonl \
-            --json_file /root/autodl-tmp/data/scenes_clip_official_v2_dataset_video_info.json \
+            --json_file /root/autodl-tmp/data/spython /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/mjh_scripts/dataset_preprocess.pycenes_clip_official_v2_dataset_video_info.json \
             --jsonl_output_path /root/autodl-tmp/data/scenes_clip_official_v2_dataset_for_training.json \
             --cache_dir /root/autodl-tmp/data/.ltx2_precomputed
 """
 
 BUCKET_EXAMPLE = {
-    "1.78-97":[512,288,97],"0.55-65":[352,352,65]
-}
+    "1.78-97":[512,288,97],"0.55-65":[352,640,65]
+}   # (WHF)
 
 
 def get_closet_bucket(height, width, frame, aspect_ratios):
@@ -69,9 +69,6 @@ def extract_video_info(json_file, output_file):
         json_file: Path to the input JSON file containing video clip paths and captions.
         output_file: Path to the output JSONL file where extracted video information will be saved.
     """
-    # validate output file
-    assert json_file.endswith('.json'), "Input file must be a JSON file."
-    if not output_file: output_file = json_file.replace('.json', f'_for_getting_bucket.jsonl')
     with open(json_file, 'r', encoding="utf-8") as f:
         data = json.load(f)
     results = []
@@ -161,6 +158,8 @@ if __name__ == "__main__":
     parser.add_argument('--topk', type=int, default=20, help='Number of top resolution buckets to display')
     args = parser.parse_args()
     if args.mode=="get_bucket": # Get Aspect Ratio Buckets
+        assert args.json_file.endswith('.json'), "Input file must be a JSON file."
+        if not args.jsonl_output_path: args.jsonl_output_path = args.json_file.replace('.json', f'_for_getting_bucket.jsonl')
         extract_video_info(args.json_file, args.jsonl_output_path)
         get_aspect_ratio_buckets(args.jsonl_output_path, topk=args.topk)
     elif args.mode=="transfer2jsonl": # Transfer json file to jsonl file for training

@@ -181,6 +181,12 @@ class DataConfig(ConfigBaseModel):
         ge=0,
     )
 
+    training_jsonl_path: str | None = Field(
+        default=None,
+        description="Path to the JSONL file containing training data",
+    )
+
+
 
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""

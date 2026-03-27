@@ -175,6 +175,9 @@ data:
   # Should contain: latents/, conditions/, and optionally audio_latents/
   preprocessed_data_root: "/root/autodl-tmp/data/.ltx2_precomputed"
 
+  # mjh's modify: Path to a JSONL file containing metadata for training samples
+  training_jsonl_path: "/root/autodl-tmp/data/scenes_clip_official_v2_dataset_for_training.jsonl"
+
   # Number of worker processes for data loading
   # Used for parallel data loading to speed up data loading
   num_dataloader_workers: 2
@@ -205,7 +208,11 @@ validation:
   # Output video dimensions [width, height, frames]
   # Width and height must be divisible by 32
   # Frames must satisfy: frames % 8 == 1 (e.g., 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, ...)
-  video_dims: [ 576, 576, 89 ]
+  video_dims: 
+    - [ 576, 576, 89 ]
+    - [ 576, 576, 89 ]
+    - [ 640, 352, 65 ]
+    - [ 288, 512, 97 ]
 
   # Frame rate for generated videos
   frame_rate: 25.0
