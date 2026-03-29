@@ -92,7 +92,8 @@ def print_config(config: LtxTrainerConfig) -> None:
                 [
                     ("Prompts", f"{len(val.prompts)} prompt(s)" if val.prompts else "[dim]—[/]"),
                     ("Interval", f"Every {val.interval} steps" if val.interval else "[dim]Disabled[/]"),
-                    ("Video Dims", f"{val.video_dims[0]}x{val.video_dims[1]}, {val.video_dims[2]} frames"),
+                    # ("Video Dims", f"{val.video_dims[0]}x{val.video_dims[1]}, {val.video_dims[2]} frames"),
+                    ("Video Dims", f"W*H*F:{val.video_dims}"),
                     ("Frame Rate", f"{val.frame_rate} fps"),
                     ("Inference Steps", str(val.inference_steps)),
                     ("CFG Scale", str(val.guidance_scale)),

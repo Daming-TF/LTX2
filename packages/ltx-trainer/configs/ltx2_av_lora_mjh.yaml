@@ -126,7 +126,7 @@ optimization:
 
   # Batch size per GPU
   # Reduce if running out of memory
-  batch_size: 1
+  batch_size: 4
 
   # Number of gradient accumulation steps
   # Effective batch size = batch_size * gradient_accumulation_steps * num_gpus
@@ -193,8 +193,8 @@ validation:
   # Provide prompts representative of your training data
   # LTX-2 prefers longer, detailed prompts that describe both visual content and audio
   prompts:
-    - "A woman with long brown hair sits at a wooden desk in a cozy home office, typing on a laptop while occasionally glancing at notes beside her. Soft natural light streams through a large window, casting warm shadows across the room. She pauses to take a sip from a ceramic mug, then continues working with focused concentration. The audio captures the gentle clicking of keyboard keys, the soft rustle of papers, and ambient room tone with occasional distant bird chirps from outside."
-    - "A chef in a white uniform stands in a professional kitchen, carefully plating a gourmet dish with precise movements. Steam rises from freshly cooked vegetables as he arranges them with tweezers. The stainless steel surfaces gleam under bright overhead lights, and various pots simmer on the stove behind him. The audio features the sizzling of pans, the clinking of utensils against plates, and the ambient hum of kitchen ventilation."
+    # - "A woman with long brown hair sits at a wooden desk in a cozy home office, typing on a laptop while occasionally glancing at notes beside her. Soft natural light streams through a large window, casting warm shadows across the room. She pauses to take a sip from a ceramic mug, then continues working with focused concentration. The audio captures the gentle clicking of keyboard keys, the soft rustle of papers, and ambient room tone with occasional distant bird chirps from outside."
+    # - "A chef in a white uniform stands in a professional kitchen, carefully plating a gourmet dish with precise movements. Steam rises from freshly cooked vegetables as he arranges them with tweezers. The stainless steel surfaces gleam under bright overhead lights, and various pots simmer on the stove behind him. The audio features the sizzling of pans, the clinking of utensils against plates, and the ambient hum of kitchen ventilation."
     - "[VISUAL]: A man with short, gray hair is sitting down. He is wearing a light blue shirt and has a watch on his left wrist. His arms are crossed. The background is a plain, light gray color.\n\n[SPEECH]: \"豆豆先生可能是我最喜歡飾演的角色\"， which translates to \"Mr. Bean is probably my favorite role to play.\"\n\n[SOUNDS]: None\n\n[TEXT]: \"豆豆先生可能是我最喜歡飾演的角色\""
     - "[VISUAL]: a classroom setting with several people sitting at desks. In the foreground, there are three men. The man on the left is wearing a blue blazer over a white shirt and is looking to his right with a somewhat amused expression. The man in the middle is wearing a brown blazer over a green shirt and is looking down at some papers on his desk. The man on the right is wearing a gray blazer over a white shirt and is leaning forward, writing on a piece of paper. There are various items on the desks, including papers, pens, and a green notepad. In the background, there are more people sitting at desks, and the room has a door with a sign on it, some chairs stacked against the wall, and two bust statues on either side of the door. The walls are a light color, and there is a fire extinguisher on the left side of the image.\n\n[SPEECH]: \"Stop.\"\n\n[SOUNDS]: There is a sound effect of a door closing, followed by laughter.\n\n[TEXT]: None."
 
@@ -209,8 +209,8 @@ validation:
   # Width and height must be divisible by 32
   # Frames must satisfy: frames % 8 == 1 (e.g., 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, ...)
   video_dims: 
-    - [ 576, 576, 89 ]
-    - [ 576, 576, 89 ]
+    # - [ 576, 576, 89 ]
+    # - [ 576, 576, 89 ]
     - [ 640, 352, 65 ]
     - [ 288, 512, 97 ]
 

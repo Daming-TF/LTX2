@@ -11,20 +11,20 @@ from pathlib import Path
 """
 📌 Step1: Split Scenes: -/ltx-trainer/scripts/split_scenes.py
 📌 Step2: Video Caption: -/ltx-trainer/scripts/video_caption.py
-👀 Step3: Get Aspect Ratio Buckets: -/ltx-trainer/mjh_scripts/dataset_preprocess.py
+👀 Step3: Get Aspect Ratio Buckets: -/ltx-trainer/mjh_scripts/dataset_preprocess.py --mode get_bucket
 📌 Step4: Precompute Latents: -/ltx-trainer/scripts/process_dataset.py
-👀 Step5: Transfer jsonl file for Training: -/ltx-trainer/scripts/dataset_preprocess.py
+👀 Step5: Transfer jsonl file for Training: -/ltx-trainer/scripts/dataset_preprocess.py --mode transfer2jsonl
 Output Structure:
         ~/data/
             └── .precomputed/
-                └── latents/            # Cached video latents
+                └── latents/            # Cached for video latents
                     └── dataset1
                         └── *.pt
                     └── dataset2
                         └── *.pt
-                ├── conditions/         # Cached text embeddings
-                ├── audio_latents/      # (only if --with-audio) Cached audio latents
-                └── reference_latents/  # (only for IC-LoRA) Cached reference video latents
+                ├── conditions/         # Cached dor text embeddings
+                ├── audio_latents/      # (only if --with-audio) Cached for audio latents
+                └── reference_latents/  # (only for IC-LoRA) Cached  for reference video latents
             └── dataset1/
                 └── *.mp4
             ├── dataset1_video_clip.json
@@ -47,8 +47,8 @@ Example:
     Mode-transfer2jsonl:
         python /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/mjh_scripts/dataset_preprocess.py \
             --mode transfer2jsonl \
-            --json_file /root/autodl-tmp/data/spython /root/autodl-tmp/mjh_proj/LTX-2/packages/ltx-trainer/mjh_scripts/dataset_preprocess.pycenes_clip_official_v2_dataset_video_info.json \
-            --jsonl_output_path /root/autodl-tmp/data/scenes_clip_official_v2_dataset_for_training.json \
+            --json_file /root/autodl-tmp/data/scenes_clip_official_v2_dataset_for_getting_bucket.jsonl \
+            --jsonl_output_path /root/autodl-tmp/data/scenes_clip_official_v2_dataset_for_training.jsonl \
             --cache_dir /root/autodl-tmp/data/.ltx2_precomputed
 """
 
@@ -133,7 +133,7 @@ def transfer2jsonl(jsonl_file, output_file, cache_dir, w_audio=True):
     data_sources = ['latents', 'conditions', 'audio_latents'] if w_audio else ['latents', 'conditions']
     with open(jsonl_file, 'r', encoding="utf-8") as f:
         data = json.load(f)
-    for _data in tqdm(data):
+    for idx, _data in enumerate(tqdm(data)):
         video_path = Path(_data['video_path'])
         # get relative path of video to root_dir
         video_rel_path = video_path.relative_to(root_dir)
@@ -143,6 +143,7 @@ def transfer2jsonl(jsonl_file, output_file, cache_dir, w_audio=True):
                 _data[source_key] = str(latent_path)
             else:
                 raise FileNotFoundError(f"Latent file {latent_path} does not exist. Please run the precompute script first.")
+        _data["sample_idx"]=idx
     with open(output_file, 'w', encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     print(f"Transfered '{jsonl_file}' to \033[35m {output_file}\033[0m")

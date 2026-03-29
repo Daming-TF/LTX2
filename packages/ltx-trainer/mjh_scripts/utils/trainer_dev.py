@@ -4,6 +4,7 @@ from typing import Any
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+import pdb
 
 sys.path.append(str(Path(__file__).parent.parent.parent / "src"))
 from ltx_trainer import logger
@@ -58,17 +59,75 @@ class LtxTrainerDev(LtxvTrainer):
         )
         self._dataloader = self._accelerator.prepare(dataloader)
 
-    def _t2V_prepare_training_inputs(self, batch: dict[str, Any], timestep_sampler: TimestepSampler,) -> dict[str, torch.Tensor]:
+    
+    def _t2v_prepare_audio_inputs(self,
+        batch: dict[str, Any],
+        sigmas: torch.Tensor,
+        audio_prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Modality, torch.Tensor, torch.Tensor]:
+        # Get audio latents - dataset provides uniform non-patchified format [B, C, T, F]
+        audio_latents = batch["a_latents"]
+
+        # Patchify audio latents: [B, C, T, F] -> [B, T, C*F]
+        audio_latents = self._training_strategy._audio_patchifier.patchify(audio_latents)
+
+        audio_seq_len = audio_latents.shape[1]
+
+        # Sample audio noise
+        audio_noise = torch.randn_like(audio_latents)
+
+        # Apply noise to audio (same sigma as video)
+        sigmas_expanded = sigmas.view(-1, 1, 1)
+        noisy_audio = (1 - sigmas_expanded) * audio_latents + sigmas_expanded * audio_noise
+
+        # Compute audio targets
+        audio_targets = audio_noise - audio_latents
+
+        # Audio timesteps: all tokens use the sampled sigma (no conditioning mask)
+        audio_timesteps = sigmas.view(-1, 1).expand(-1, audio_seq_len)
+
+        # Generate audio positions
+        audio_positions = self._training_strategy._get_audio_positions(
+            num_time_steps=audio_seq_len,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Create audio Modality
+        audio_modality = Modality(
+            enabled=True,
+            latent=noisy_audio,
+            timesteps=audio_timesteps,
+            positions=audio_positions,
+            context=audio_prompt_embeds,
+            context_mask=prompt_attention_mask,
+        )
+
+        # Audio loss mask: all tokens contribute to loss (no conditioning)
+        audio_loss_mask = torch.ones(batch_size, audio_seq_len, dtype=torch.bool, device=device)
+
+        return audio_modality, audio_targets, audio_loss_mask
+
+
+    def _t2V_prepare_training_inputs(
+        self, 
+        batch: dict[str, Any], 
+        timestep_sampler: TimestepSampler,
+    ) -> dict[str, torch.Tensor]:
         """
         Override the T2V training input preparation to add custom behavior for development."""
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
-        latents = batch["v_latents"]
-        video_latents = batch["a_latents"]
+        video_latents = batch["v_latents"]
 
         # Get video dimensions (assume same for all batch elements)
         num_frames = batch["v_num_frames"][0].item()
-        height = latents["height"][0].item()
-        width = latents["width"][0].item()
+        height = batch["v_height"][0].item()
+        width = batch["v_width"][0].item()
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         video_latents = self._training_strategy._video_patchifier.patchify(video_latents)
@@ -149,7 +208,7 @@ class LtxTrainerDev(LtxvTrainer):
         audio_loss_mask = None
 
         if self._training_strategy.config.with_audio:
-            audio_modality, audio_targets, audio_loss_mask = self._training_strategy._prepare_audio_inputs(
+            audio_modality, audio_targets, audio_loss_mask = self._t2v_prepare_audio_inputs(
                 batch=batch,
                 sigmas=sigmas,
                 audio_prompt_embeds=audio_prompt_embeds,
@@ -189,13 +248,18 @@ class LtxTrainerDev(LtxvTrainer):
             Tensor: The computed loss for the batch.
         """
         # Apply embedding connectors to transform pre-computed text embeddings
-        video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-            batch["c_prompt_embeds"], 
-            batch["c_prompt_attention_mask"]
-        )
-        batch["video_prompt_embeds"] = video_embeds
-        batch["audio_prompt_embeds"] = audio_embeds
-        batch["prompt_attention_mask"] = attention_mask
+        video_embeds, audio_embeds, attention_mask = [], [], []
+        for _ in range(batch["c_prompt_embeds"].shape[0]):
+            _video_embeds, _audio_embeds, _attention_mask = self._text_encoder._run_connectors(
+                batch["c_prompt_embeds"][_].unsqueeze(0),               # {1,1024,3840}
+                batch["c_prompt_attention_mask"][_].unsqueeze(0)        # {1,1024}
+            )
+            video_embeds.append(_video_embeds)
+            audio_embeds.append(_audio_embeds)
+            attention_mask.append(_attention_mask)
+        batch["video_prompt_embeds"] = torch.concat(video_embeds)
+        batch["audio_prompt_embeds"] = torch.concat(audio_embeds)
+        batch["prompt_attention_mask"] = torch.concat(attention_mask)
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._t2V_prepare_training_inputs(batch, self._timestep_sampler)

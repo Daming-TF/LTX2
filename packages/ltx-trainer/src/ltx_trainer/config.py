@@ -221,24 +221,30 @@ class ValidationConfig(ConfigBaseModel):
         ge=1,
     )
 
-    video_dims: tuple[int, int, int] = Field(
-        default=(960, 544, 97),
-        description="Dimensions of validation videos (width, height, frames). "
-        "Width and height must be divisible by 32. Frames must satisfy frames % 8 == 1 for LTX-2.",
+    # video_dims: tuple[int, int, int] = Field(
+    #     default=(960, 544, 97),
+    #     description="Dimensions of validation videos (width, height, frames). "
+    #     "Width and height must be divisible by 32. Frames must satisfy frames % 8 == 1 for LTX-2.",
+    # )
+
+    video_dims: list[tuple[int, int, int]] = Field(
+        default_factory=list,
     )
+
 
     @field_validator("video_dims")
     @classmethod
-    def validate_video_dims(cls, v: tuple[int, int, int]) -> tuple[int, int, int]:
+    def validate_video_dims(cls, v: list[tuple[int, int, int]]) -> tuple[int, int, int]:
         """Validate video dimensions for LTX-2 compatibility."""
-        width, height, frames = v
+        for _v in v:
+            width, height, frames = _v
 
-        if width % 32 != 0:
-            raise ValueError(f"Width ({width}) must be divisible by 32")
-        if height % 32 != 0:
-            raise ValueError(f"Height ({height}) must be divisible by 32")
-        if frames % 8 != 1:
-            raise ValueError(f"Frames ({frames}) must satisfy frames % 8 == 1 for LTX-2 (e.g., 1, 9, 17, 25, ...)")
+            if width % 32 != 0:
+                raise ValueError(f"Width ({width}) must be divisible by 32")
+            if height % 32 != 0:
+                raise ValueError(f"Height ({height}) must be divisible by 32")
+            if frames % 8 != 1:
+                raise ValueError(f"Frames ({frames}) must satisfy frames % 8 == 1 for LTX-2 (e.g., 1, 9, 17, 25, ...)")
 
         return v
 

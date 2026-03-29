@@ -104,6 +104,7 @@ def prepare_train_dataset(dataset, accelerator, data_sources, aspect_ratios=None
                     # Normalize latent(video & audio) format if this is a latent source
                     if "latent" in dir_name.lower(): latent_tmp = _normalize_video_latents(latent_tmp)
                     assert isinstance(latent_tmp, dict), f"Expected loaded data to be a dict, but got {type(latent_tmp)}."
+                    if dir_name=="latents": dir_name = "video_latents"
                     for k, v in latent_tmp.items():
                         package.setdefault(f"{dir_name[0]}_{k}", [])
                         package[f"{dir_name[0]}_{k}"].append(v)
@@ -130,8 +131,10 @@ def collate_fn(batch):
     for k, v in package.items():
         if isinstance(v[0], torch.Tensor):
             package[k] = torch.stack(v)
-        elif k == 'sample_idx':
-            package[k] = torch.tensor(v, dtype=torch.long)
+        # elif k == 'sample_idx':
+        #     package[k] = torch.tensor(v, dtype=torch.long)
+        elif not isinstance(v[0], str):
+            package[k] = torch.tensor(v)
         else:
             package[k] = v
     return package

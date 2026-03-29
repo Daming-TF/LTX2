@@ -757,7 +757,7 @@ class LtxvTrainer:
 
         # mjh's modify
         video_paths = []
-        if isinstance(self._config.validation.video_dims[0], list):
+        if isinstance(self._config.validation.video_dims[0], tuple):
             video_dims = self._config.validation.video_dims
             assert len(video_dims) == len(self._config.validation.prompts), "Length of validation.video_dims must match number of prompts when using per-prompt dimensions."
         elif isinstance(self._config.validation.video_dims[0], int) and len(self._config.validation.video_dims) == 3:
