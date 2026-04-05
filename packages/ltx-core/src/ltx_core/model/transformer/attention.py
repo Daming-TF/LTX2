@@ -122,22 +122,18 @@ class AttentionFunction(Enum):
     FLASH_ATTENTION_3 = "flash_attention_3"
     DEFAULT = "default"
 
-    def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def to_callable(self) -> AttentionCallable:
+        """Resolve to a concrete callable. Use this at module init time so that
+        torch.compile can trace through the attention call without graph breaks."""
         if self is AttentionFunction.PYTORCH:
-            return PytorchAttention()(q, k, v, heads, mask)
+            return PytorchAttention()
         elif self is AttentionFunction.XFORMERS:
-            return XFormersAttention()(q, k, v, heads, mask)
+            return XFormersAttention()
         elif self is AttentionFunction.FLASH_ATTENTION_3:
-            return FlashAttention3()(q, k, v, heads, mask)
+            return FlashAttention3()
         else:
             # Default behavior: XFormers if installed else - PyTorch
-            return (
-                XFormersAttention()(q, k, v, heads, mask)
-                if memory_efficient_attention is not None
-                else PytorchAttention()(q, k, v, heads, mask)
-            )
+            return XFormersAttention() if memory_efficient_attention is not None else PytorchAttention()
 
 
 class Attention(torch.nn.Module):
@@ -154,7 +150,11 @@ class Attention(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
-        self.attention_function = attention_function
+        self.attention_function = (
+            attention_function.to_callable()
+            if isinstance(attention_function, AttentionFunction)
+            else attention_function
+        )
 
         inner_dim = dim_head * heads
         context_dim = query_dim if context_dim is None else context_dim
@@ -184,21 +184,55 @@ class Attention(torch.nn.Module):
         mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+        all_perturbed: bool = False,
     ) -> torch.Tensor:
-        q = self.to_q(x)
+        """Multi-head attention with optional RoPE, perturbation masking, and per-head gating.
+        When ``perturbation_mask`` is all zeros, the expensive query/key path
+        (linear projections, RMSNorm, RoPE) is skipped entirely and only the
+        value projection is used as a pass-through.
+        Args:
+            x: Query input tensor of shape ``(B, T, query_dim)``.
+            context: Key/value context tensor of shape ``(B, S, context_dim)``.
+                Falls back to ``x`` (self-attention) when *None*.
+            mask: Optional attention mask. Interpretation depends on the attention
+                backend (additive bias for xformers/PyTorch SDPA).
+            pe: Rotary positional embeddings applied to both ``q`` and ``k``.
+            k_pe: Separate rotary positional embeddings for ``k`` only. When
+                *None*, ``pe`` is reused for keys.
+            perturbation_mask: Optional mask in ``[0, 1]`` that
+                blends the attention output with the raw value projection:
+                ``out = attn_out * mask + v * (1 - mask)``.
+                **1** keeps the full attention output, **0** bypasses attention
+                and passes the value projection through unchanged.
+                *None* or all-ones means standard attention; all-zeros skips
+                the query/key path entirely for efficiency.
+            all_perturbed: Whether all perturbations are active for this block.
+        Returns:
+            Output tensor of shape ``(B, T, query_dim)``.
+        """
         context = x if context is None else context
-        k = self.to_k(context)
+        use_attention = not all_perturbed
+
         v = self.to_v(context)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        if not use_attention:
+            out = v
+        else:
+            q = self.to_q(x)
+            k = self.to_k(context)
 
-        if pe is not None:
-            q = apply_rotary_emb(q, pe, self.rope_type)
-            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-        # attention_function can be an enum *or* a custom callable
-        out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+
+            out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
+
+            if perturbation_mask is not None:
+                out = out * perturbation_mask + v * (1 - perturbation_mask)
 
         # Apply per-head gating if enabled
         if self.to_gate_logits is not None:

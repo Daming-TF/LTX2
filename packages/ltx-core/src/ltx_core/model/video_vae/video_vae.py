@@ -1,5 +1,4 @@
 import logging
-from dataclasses import replace
 from typing import Any, Callable, Iterator, List, Tuple
 
 import torch
@@ -13,17 +12,23 @@ from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, Paddi
 from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify, unpatchify
 from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample, SpaceToDepthDownsample
-from ltx_core.model.video_vae.tiling import (
+from ltx_core.model.video_vae.tiling import TilingConfig
+from ltx_core.tiling import (
     DEFAULT_MAPPING_OPERATION,
     DEFAULT_SPLIT_OPERATION,
     DimensionIntervals,
     MappingOperation,
-    SplitOperation,
     Tile,
-    TilingConfig,
     compute_rectangular_mask_1d,
     compute_trapezoidal_mask_1d,
     create_tiles,
+    split_temporal,
+)
+from ltx_core.tiling import (
+    split_by_size as split_in_spatial,
+)
+from ltx_core.tiling import (
+    split_temporal_causal as split_in_temporal,
 )
 from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape
 
@@ -444,12 +449,12 @@ def prepare_tiles_for_encoding(
         # Define split and map operations for the spatial dimensions
 
         # Height axis (H)
-        splitters[3] = split_with_symmetric_overlaps(tile_size_px, overlap_px)
-        mappers[3] = make_mapping_operation(map_spatial_interval_to_latent, scale=VIDEO_SCALE_FACTORS.height)
+        splitters[3] = split_in_spatial(tile_size_px, overlap_px)
+        mappers[3] = to_mapping_operation(map_spatial_interval_to_latent, scale=VIDEO_SCALE_FACTORS.height)
 
         # Width axis (W)
-        splitters[4] = split_with_symmetric_overlaps(tile_size_px, overlap_px)
-        mappers[4] = make_mapping_operation(map_spatial_interval_to_latent, scale=VIDEO_SCALE_FACTORS.width)
+        splitters[4] = split_in_spatial(tile_size_px, overlap_px)
+        mappers[4] = to_mapping_operation(map_spatial_interval_to_latent, scale=VIDEO_SCALE_FACTORS.width)
 
     if tiling_config is not None and tiling_config.temporal_config is not None:
         cfg = tiling_config.temporal_config
@@ -460,8 +465,8 @@ def prepare_tiles_for_encoding(
             logger.warning(f"Overlap frames {overlap_frames} is less than 16, setting to minimum required 16")
             overlap_frames = minimum_temporal_overlap_frames
 
-        splitters[2] = split_temporal_frames(tile_size_frames, overlap_frames)
-        mappers[2] = make_mapping_operation(map_temporal_interval_to_latent, scale=VIDEO_SCALE_FACTORS.time)
+        splitters[2] = split_temporal(tile_size_frames, overlap_frames)
+        mappers[2] = to_mapping_operation(map_temporal_interval_to_latent, scale=VIDEO_SCALE_FACTORS.time)
 
     return create_tiles(video.shape, splitters, mappers)
 
@@ -515,17 +520,21 @@ def _make_decoder_block(
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_time":
+        out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
             dims=convolution_dimensions,
             in_channels=in_channels,
             stride=(2, 1, 1),
+            out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_space":
+        out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
             dims=convolution_dimensions,
             in_channels=in_channels,
             stride=(1, 2, 2),
+            out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_all":
@@ -585,6 +594,7 @@ class VideoDecoder(nn.Module):
         causal: bool = False,
         timestep_conditioning: bool = False,
         decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
+        base_channels: int = 128,
     ):
         super().__init__()
 
@@ -612,15 +622,9 @@ class VideoDecoder(nn.Module):
         self.decode_noise_scale = 0.025
         self.decode_timestep = 0.05
 
-        # Compute initial feature_channels by going through blocks in reverse
-        # This determines the channel width at the start of the decoder
-        feature_channels = in_channels
-        for block_name, block_params in list(reversed(decoder_blocks)):
-            block_config = block_params if isinstance(block_params, dict) else {}
-            if block_name == "res_x_y":
-                feature_channels = feature_channels * block_config.get("multiplier", 2)
-            if block_name == "compress_all":
-                feature_channels = feature_channels * block_config.get("multiplier", 1)
+        # LTX VAE decoder architecture uses 3 upsampler blocks with multiplier equals to 2.
+        # Hence the total feature_channels is multiplied by 8 (2^3).
+        feature_channels = base_channels * 8
 
         self.conv_in = make_conv_nd(
             dims=convolution_dimensions,
@@ -785,8 +789,8 @@ class VideoDecoder(nn.Module):
                 axis_length = latent.shape[axis_idx]
                 lower_threshold = max(2, overlap + 1)
                 tile_size = max(lower_threshold, round(size * axis_length / long_side))
-                splitters[axis_idx] = split_with_symmetric_overlaps(tile_size, overlap)
-                mappers[axis_idx] = make_mapping_operation(map_spatial_interval_to_pixel, scale=factor)
+                splitters[axis_idx] = split_in_spatial(tile_size, overlap)
+                mappers[axis_idx] = to_mapping_operation(map_spatial_slice, scale=factor)
 
             enable_on_axis(3, self.video_downscale_factors.height)
             enable_on_axis(4, self.video_downscale_factors.width)
@@ -795,8 +799,8 @@ class VideoDecoder(nn.Module):
             cfg = tiling_config.temporal_config
             tile_size = cfg.tile_size_in_frames // self.video_downscale_factors.time
             overlap = cfg.tile_overlap_in_frames // self.video_downscale_factors.time
-            splitters[2] = split_temporal_latents(tile_size, overlap)
-            mappers[2] = make_mapping_operation(map_temporal_interval_to_frame, scale=self.video_downscale_factors.time)
+            splitters[2] = split_in_temporal(tile_size, overlap)
+            mappers[2] = to_mapping_operation(map_temporal_slice, scale=self.video_downscale_factors.time)
 
         return create_tiles(latent.shape, splitters, mappers)
 
@@ -893,6 +897,29 @@ class VideoDecoder(nn.Module):
             previous_weights = previous_weights.clamp(min=1e-8)
             yield previous_chunk / previous_weights
 
+    def decode_video(
+        self,
+        latent: torch.Tensor,
+        tiling_config: TilingConfig | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode a video latent tensor, yielding uint8 chunks ``[f, h, w, c]``.
+        Subclasses (e.g. ``DistributedVideoDecoder``) may override this to
+        control eagerness or distribution across ranks.
+        """
+
+        def convert_to_uint8(frames: torch.Tensor) -> torch.Tensor:
+            frames = (((frames + 1.0) / 2.0).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+            frames = rearrange(frames[0], "c f h w -> f h w c")
+            return frames
+
+        if tiling_config is not None:
+            for frames in self.tiled_decode(latent, tiling_config, generator=generator):
+                yield convert_to_uint8(frames)
+        else:
+            decoded = self(latent, generator=generator)
+            yield convert_to_uint8(decoded)
+
     def _group_tiles_by_temporal_slice(self, tiles: List[Tile]) -> List[List[Tile]]:
         """Group tiles by their temporal output slice."""
         if not tiles:
@@ -964,36 +991,6 @@ class VideoDecoder(nn.Module):
         return weights
 
 
-def decode_video(
-    latent: torch.Tensor,
-    video_decoder: VideoDecoder,
-    tiling_config: TilingConfig | None = None,
-    generator: torch.Generator | None = None,
-) -> Iterator[torch.Tensor]:
-    """
-    Decode a video latent tensor with the given decoder.
-    Args:
-        latent: Tensor [c, f, h, w]
-        video_decoder: Decoder module.
-        tiling_config: Optional tiling settings.
-        generator: Optional random generator for deterministic decoding.
-    Yields:
-        Decoded chunk [f, h, w, c], uint8 in [0, 255].
-    """
-
-    def convert_to_uint8(frames: torch.Tensor) -> torch.Tensor:
-        frames = (((frames + 1.0) / 2.0).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-        frames = rearrange(frames[0], "c f h w -> f h w c")
-        return frames
-
-    if tiling_config is not None:
-        for frames in video_decoder.tiled_decode(latent, tiling_config, generator=generator):
-            yield convert_to_uint8(frames)
-    else:
-        decoded_video = video_decoder(latent, generator=generator)
-        yield convert_to_uint8(decoded_video)
-
-
 def get_video_chunks_number(num_frames: int, tiling_config: TilingConfig | None = None) -> int:
     """
     Get the number of video chunks for a given number of frames and tiling configuration.
@@ -1010,82 +1007,7 @@ def get_video_chunks_number(num_frames: int, tiling_config: TilingConfig | None 
     return (num_frames - 1 + frame_stride - 1) // frame_stride
 
 
-def split_with_symmetric_overlaps(size: int, overlap: int) -> SplitOperation:
-    def split(dimension_size: int) -> DimensionIntervals:
-        if dimension_size <= size:
-            return DEFAULT_SPLIT_OPERATION(dimension_size)
-        amount = (dimension_size + size - 2 * overlap - 1) // (size - overlap)
-        starts = [i * (size - overlap) for i in range(amount)]
-        ends = [start + size for start in starts]
-        ends[-1] = dimension_size
-        left_ramps = [0] + [overlap] * (amount - 1)
-        right_ramps = [overlap] * (amount - 1) + [0]
-        return DimensionIntervals(starts=starts, ends=ends, left_ramps=left_ramps, right_ramps=right_ramps)
-
-    return split
-
-
-def split_temporal_latents(size: int, overlap: int) -> SplitOperation:
-    """Split a temporal axis into overlapping tiles with causal handling.
-    Example with size=24, overlap=8 (units are whatever axis you split):
-        Non-causal split would produce:
-            Tile 0: [0, 24), left_ramp=0,  right_ramp=8
-            Tile 1: [16, 40), left_ramp=8, right_ramp=8
-            Tile 2: [32, 56), left_ramp=8, right_ramp=0
-        Causal split produces:
-            Tile 0: [0, 24), left_ramp=0,  right_ramp=8  (unchanged - starts at anchor)
-            Tile 1: [15, 40), left_ramp=9, right_ramp=8  (shifted back 1, ramp +1)
-            Tile 2: [31, 56), left_ramp=9, right_ramp=0  (shifted back 1, ramp +1)
-    This ensures each tile can causally depend on frames from previous tiles while maintaining
-    proper temporal continuity through the blend ramps.
-    Args:
-        size: Tile size in *axis units* (latent steps for LTX time tiling)
-        overlap: Overlap between tiles in the same units
-    Returns:
-        Split operation that divides temporal dimension with causal handling
-    """
-    non_causal_split = split_with_symmetric_overlaps(size, overlap)
-
-    def split(dimension_size: int) -> DimensionIntervals:
-        if dimension_size <= size:
-            return DEFAULT_SPLIT_OPERATION(dimension_size)
-        intervals = non_causal_split(dimension_size)
-
-        starts = intervals.starts
-        starts[1:] = [s - 1 for s in starts[1:]]
-
-        # Extend blend ramps by 1 for non-first tiles to blend over the extra frame
-        left_ramps = intervals.left_ramps
-        left_ramps[1:] = [r + 1 for r in left_ramps[1:]]
-
-        return replace(intervals, starts=starts, left_ramps=left_ramps)
-
-    return split
-
-
-def split_temporal_frames(tile_size_frames: int, overlap_frames: int) -> SplitOperation:
-    """Split a temporal axis in video frame space into overlapping tiles.
-    Args:
-        tile_size_frames: Tile length in frames.
-        overlap_frames: Overlap between consecutive tiles in frames.
-    Returns:
-        Split operation that takes frame count and returns DimensionIntervals in frame indices.
-    """
-    non_causal_split = split_with_symmetric_overlaps(tile_size_frames, overlap_frames)
-
-    def split(dimension_size: int) -> DimensionIntervals:
-        if dimension_size <= tile_size_frames:
-            return DEFAULT_SPLIT_OPERATION(dimension_size)
-        intervals = non_causal_split(dimension_size)
-        ends = intervals.ends
-        ends[:-1] = [e + 1 for e in ends[:-1]]
-        right_ramps = [0] * len(intervals.right_ramps)
-        return replace(intervals, ends=ends, right_ramps=right_ramps)
-
-    return split
-
-
-def make_mapping_operation(
+def to_mapping_operation(
     map_func: Callable[[int, int, int, int, int], Tuple[slice, torch.Tensor | None]],
     scale: int,
 ) -> MappingOperation:
@@ -1103,13 +1025,10 @@ def make_mapping_operation(
     def map_op(intervals: DimensionIntervals) -> tuple[list[slice], list[torch.Tensor | None]]:
         output_slices: list[slice] = []
         masks_1d: list[torch.Tensor | None] = []
-        number_of_slices = len(intervals.starts)
-        for i in range(number_of_slices):
-            start = intervals.starts[i]
-            end = intervals.ends[i]
-            left_ramp = intervals.left_ramps[i]
-            right_ramp = intervals.right_ramps[i]
-            output_slice, mask_1d = map_func(start, end, left_ramp, right_ramp, scale)
+        for interval in intervals.intervals:
+            output_slice, mask_1d = map_func(
+                interval.start, interval.end, interval.left_ramp, interval.right_ramp, scale
+            )
             output_slices.append(output_slice)
             masks_1d.append(mask_1d)
         return output_slices, masks_1d
@@ -1117,31 +1036,13 @@ def make_mapping_operation(
     return map_op
 
 
-def map_temporal_interval_to_frame(
-    begin: int,
-    end: int,
-    left_ramp: int,
-    right_ramp: int,
-    scale: int,
-) -> Tuple[slice, torch.Tensor]:
-    """Map temporal interval in latent space to video frame space.
-    Args:
-        begin: Start position in latent space
-        end: End position in latent space
-        left_ramp: Left ramp size in latent space
-        right_ramp: Right ramp size in latent space
-        scale: Scale factor for transformation
-    Returns:
-        Tuple of (output_slice, blend_mask)
-    """
+def map_temporal_slice(begin: int, end: int, left_ramp: int, right_ramp: int, scale: int) -> Tuple[slice, torch.Tensor]:
     start = begin * scale
     stop = 1 + (end - 1) * scale
+    left_ramp = 0 if left_ramp == 0 else 1 + (left_ramp - 1) * scale
+    right_ramp = right_ramp * scale
 
-    left_ramp_frames = 0 if left_ramp == 0 else 1 + (left_ramp - 1) * scale
-    right_ramp_frames = right_ramp * scale
-
-    mask_1d = compute_trapezoidal_mask_1d(stop - start, left_ramp_frames, right_ramp_frames, True)
-    return slice(start, stop), mask_1d
+    return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, True)
 
 
 def map_temporal_interval_to_latent(
@@ -1172,25 +1073,13 @@ def map_temporal_interval_to_latent(
     return slice(start, stop), mask_1d
 
 
-def map_spatial_interval_to_pixel(
-    begin: int,
-    end: int,
-    left_ramp: int,
-    right_ramp: int,
-    scale: int,
-) -> Tuple[slice, torch.Tensor]:
-    """Map spatial interval in latent space to pixel space.
-    Args:
-        begin: Start position in latent space
-        end: End position in latent space
-        left_ramp: Left ramp size in latent space
-        right_ramp: Right ramp size in latent space
-        scale: Scale factor for transformation
-    """
+def map_spatial_slice(begin: int, end: int, left_ramp: int, right_ramp: int, scale: int) -> Tuple[slice, torch.Tensor]:
     start = begin * scale
     stop = end * scale
-    mask_1d = compute_trapezoidal_mask_1d(stop - start, left_ramp * scale, right_ramp * scale, False)
-    return slice(start, stop), mask_1d
+    left_ramp = left_ramp * scale
+    right_ramp = right_ramp * scale
+
+    return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, False)
 
 
 def map_spatial_interval_to_latent(

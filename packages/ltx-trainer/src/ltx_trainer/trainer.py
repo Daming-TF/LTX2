@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import warnings
 from pathlib import Path
@@ -28,17 +29,19 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 
+from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.model_loader import load_model as load_ltx_model
-from ltx_trainer.model_loader import load_text_encoder
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
+from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -85,11 +88,14 @@ class LtxvTrainer:
         self._load_models()
         self._setup_accelerator()
         self._collect_trainable_params()
+        self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
         self._prepare_models_for_training()
         self._dataset = None
         self._global_step = -1
-        self._checkpoint_paths = []
+        self._checkpoint_paths: list[Path] = []
+        self._training_state_paths: list[Path] = []
+        self._training_state_size_warned = False
         self._init_wandb()
 
     def train(  # noqa: PLR0912, PLR0915
@@ -99,6 +105,9 @@ class LtxvTrainer:
     ) -> tuple[Path, TrainingStats]:
         """
         Start the training process.
+        Args:
+            disable_progress_bars: Disable Rich progress bars (useful for multi-process runs).
+            step_callback: Optional callback invoked after each optimization step.
         Returns:
             Tuple of (saved_model_path, training_stats)
         """
@@ -108,11 +117,18 @@ class LtxvTrainer:
 
         train_start_time = time.time()
 
-        # Use the same seed for all processes and ensure deterministic operations
+        initial_step, training_state = self._resume_state
+        resuming = training_state is not None
+
         set_seed(cfg.seed)
         logger.debug(f"Process {self._accelerator.process_index} using seed: {cfg.seed}")
 
         self._init_optimizer()
+
+        if training_state is not None and not self._restore_training_state(training_state):
+            initial_step = 0
+            resuming = False
+
         self._init_dataloader()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
@@ -125,27 +141,36 @@ class LtxvTrainer:
         # Save the training configuration as YAML
         self._save_config()
 
-        logger.info("🚀 Starting training...")
+        remaining_steps = cfg.optimization.steps - initial_step
+        if remaining_steps <= 0:
+            raise ValueError(
+                f"No remaining training steps: initial_step={initial_step} >= "
+                f"target_steps={cfg.optimization.steps}. Nothing to train."
+            )
+
+        if resuming:
+            logger.info(f"🚀 Resuming training from step {initial_step} → {cfg.optimization.steps}")
+        else:
+            logger.info("🚀 Starting training...")
 
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
         progress = TrainingProgress(
             enabled=progress_enabled,
-            total_steps=cfg.optimization.steps,
+            total_steps=remaining_steps,
         )
 
         if IS_MAIN_PROCESS and disable_progress_bars:
             logger.warning("Progress bars disabled. Intermediate status messages will be logged instead.")
 
         self._transformer.train()
-        self._global_step = 0
+        self._global_step = initial_step
 
         peak_mem_during_training = start_mem
 
         sampled_videos_paths = None
 
         with progress:
-            # Initial validation before training starts
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
                 sampled_videos_paths = self._sample_videos(progress)
                 if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
@@ -153,7 +178,7 @@ class LtxvTrainer:
 
             self._accelerator.wait_for_everyone()
 
-            for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
+            for step in range(remaining_steps * cfg.optimization.gradient_accumulation_steps):
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -242,9 +267,9 @@ class LtxvTrainer:
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
                         elapsed = time.time() - train_start_time
-                        progress_percentage = self._global_step / cfg.optimization.steps
-                        if progress_percentage > 0:
-                            total_estimated = elapsed / progress_percentage
+                        steps_done = self._global_step - initial_step
+                        if steps_done > 0:
+                            total_estimated = elapsed / steps_done * remaining_steps
                             total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
                         else:
                             total_time = "calculating..."
@@ -266,7 +291,7 @@ class LtxvTrainer:
 
         # Calculate steps/second over entire training
         total_time_seconds = train_end_time - train_start_time
-        steps_per_second = cfg.optimization.steps / total_time_seconds
+        steps_per_second = remaining_steps / total_time_seconds
 
         samples_per_second = steps_per_second * self._accelerator.num_processes * cfg.optimization.batch_size
 
@@ -310,9 +335,22 @@ class LtxvTrainer:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
-        video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-            conditions["prompt_embeds"], conditions["prompt_attention_mask"]
+
+        if "video_prompt_embeds" in conditions:
+            # New format: separate video/audio features from precompute()
+            video_features = conditions["video_prompt_embeds"]
+            audio_features = conditions.get("audio_prompt_embeds")
+        else:
+            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
+            video_features = conditions["prompt_embeds"]
+            audio_features = conditions["prompt_embeds"]
+
+        mask = conditions["prompt_attention_mask"]
+        additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+        video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+            video_features, audio_features, additive_mask
         )
+
         conditions["video_prompt_embeds"] = video_embeds
         conditions["audio_prompt_embeds"] = audio_embeds
         conditions["prompt_attention_mask"] = attention_mask
@@ -334,24 +372,29 @@ class LtxvTrainer:
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
-        """Load text encoder, computes and returns validation embeddings."""
+        """Load text encoder + embeddings processor, compute and cache validation embeddings."""
 
         # This method:
-        #   1. Loads the text encoder on GPU
-        #   2. If validation prompts are configured, computes and caches their embeddings
-        #   3. Unloads the heavy Gemma model while keeping the lightweight embedding connectors
-        #   The text encoder is kept (as self._text_encoder) but with model/tokenizer/feature_extractor
-        #   set to None. Only the embedding connectors remain for use during training.
+        #   1. Loads the pure Gemma text encoder on GPU
+        #   2. Loads the embeddings processor (feature extractor + connectors)
+        #   3. If validation prompts are configured, computes and caches their embeddings
+        #   4. Unloads the Gemma model entirely, keeps the embeddings processor for training
 
-        # Load text encoder on GPU
+        # Load text encoder (pure Gemma LLM) on GPU
         logger.debug("Loading text encoder...")
-
-        self._text_encoder = load_text_encoder(
-            checkpoint_path=self._config.model.model_path,
+        text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
             device="cuda",
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+        )
+
+        # Load embeddings processor (feature extractor + connectors)
+        logger.debug("Loading embeddings processor...")
+        self._embeddings_processor = load_embeddings_processor(
+            checkpoint_path=self._config.model.model_path,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
 
         # Cache validation embeddings if prompts are configured
@@ -361,22 +404,26 @@ class LtxvTrainer:
             cached_embeddings = []
             with torch.inference_mode():
                 for prompt in self._config.validation.prompts:
-                    v_ctx_pos, a_ctx_pos, _ = self._text_encoder(prompt)
-                    v_ctx_neg, a_ctx_neg, _ = self._text_encoder(self._config.validation.negative_prompt)
+                    pos_hs, pos_mask = text_encoder.encode(prompt)
+                    pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
+
+                    neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
+                    neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
 
                     cached_embeddings.append(
                         CachedPromptEmbeddings(
-                            video_context_positive=v_ctx_pos.cpu(),
-                            audio_context_positive=a_ctx_pos.cpu(),
-                            video_context_negative=v_ctx_neg.cpu() if v_ctx_neg is not None else None,
-                            audio_context_negative=a_ctx_neg.cpu() if a_ctx_neg is not None else None,
+                            video_context_positive=pos_out.video_encoding.cpu(),
+                            audio_context_positive=pos_out.audio_encoding.cpu(),
+                            video_context_negative=neg_out.video_encoding.cpu(),
+                            audio_context_negative=(
+                                neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
+                            ),
                         )
                     )
 
-        # Unload heavy components to free VRAM, keeping only the embedding connectors
-        self._text_encoder.model = None
-        self._text_encoder.tokenizer = None
-        self._text_encoder.feature_extractor_linear = None
+        # Unload Gemma model and feature extractor, keep only connectors for training
+        del text_encoder
+        self._embeddings_processor.feature_extractor = None
 
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
@@ -414,7 +461,7 @@ class LtxvTrainer:
         self._scheduler = components.scheduler
         self._audio_vae = components.audio_vae_decoder
         self._vocoder = components.vocoder
-        # Note: self._text_encoder was set in _load_text_encoder_and_cache_embeddings
+        # Note: self._embeddings_processor was set in _load_text_encoder_and_cache_embeddings
 
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
@@ -477,21 +524,26 @@ class LtxvTrainer:
         self._transformer = get_peft_model(self._transformer, lora_config)
 
     def _load_checkpoint(self) -> None:
-        """Load checkpoint if specified in config."""
+        """Load checkpoint if specified in config, then resolve resume state."""
         if not self._config.model.load_checkpoint:
+            self._resume_state: tuple[int, TrainingState | None] = (0, None)
             return
 
         checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
         if not checkpoint_path:
             logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
+            self._resume_state = (0, None)
             return
 
+        self._loaded_checkpoint_path = checkpoint_path
         logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
 
         if self._config.model.training_mode == "full":
             self._load_full_checkpoint(checkpoint_path)
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
+
+        self._resume_state = self._resolve_resume_state()
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
@@ -513,6 +565,98 @@ class LtxvTrainer:
         set_peft_model_state_dict(base_model, state_dict)
 
         logger.info("✅ LoRA checkpoint loaded successfully")
+
+    def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
+        """Determine resume state by looking for a training state file next to the loaded checkpoint.
+        Returns (initial_step, TrainingState or None).
+        If no_resume config is set, no checkpoint loaded, or no state file found: returns (0, None).
+        """
+        if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
+            return 0, None
+
+        state = self._load_training_state(self._loaded_checkpoint_path)
+        if state is None:
+            return 0, None
+
+        fp = state.config_fingerprint
+        cfg = self._config
+        mismatches: list[str] = []
+        if fp.optimizer_type != cfg.optimization.optimizer_type:
+            mismatches.append(f"optimizer_type: {fp.optimizer_type} → {cfg.optimization.optimizer_type}")
+        if fp.scheduler_type != cfg.optimization.scheduler_type:
+            mismatches.append(f"scheduler_type: {fp.scheduler_type} → {cfg.optimization.scheduler_type}")
+        if fp.training_mode != cfg.model.training_mode:
+            mismatches.append(f"training_mode: {fp.training_mode} → {cfg.model.training_mode}")
+        if (
+            cfg.model.training_mode == "lora"
+            and cfg.lora is not None
+            and fp.lora_rank is not None
+            and fp.lora_rank != cfg.lora.rank
+        ):
+            mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
+        if mismatches:
+            logger.warning(
+                f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
+                "Starting from step 0. Set checkpoints.no_resume=true to silence this warning."
+            )
+            return 0, None
+
+        if state.global_step < 0:
+            logger.warning(f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0.")
+            return 0, None
+        logger.info(f"📌 Resuming from step {state.global_step}")
+        return state.global_step, state
+
+    @staticmethod
+    def _load_training_state(checkpoint_path: Path) -> TrainingState | None:
+        """Load training state file that corresponds to a checkpoint weights file."""
+        match = re.search(r"step_(\d+)", checkpoint_path.name)
+        if not match:
+            return None
+
+        step_str = match.group(1)
+        state_path = checkpoint_path.parent / f"training_state_step_{step_str}.pt"
+
+        if not state_path.exists():
+            return None
+
+        try:
+            raw: dict = torch.load(state_path, map_location="cpu", weights_only=False)
+            state = TrainingState.from_save_dict(raw)
+            logger.info(f"📥 Loaded training state from {state_path}")
+            return state
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load training state from {state_path}: {e}. Starting from step 0.")
+            return None
+
+    def _restore_training_state(self, training_state: TrainingState) -> bool:
+        """Restore optimizer, scheduler, and RNG states from a loaded TrainingState.
+        Must be called after _init_optimizer() (which calls accelerator.prepare).
+        Returns True if restore succeeded, False if it failed (caller should fall back to step 0).
+        """
+        try:
+            if training_state.optimizer_state_dict is not None:
+                self._optimizer.load_state_dict(training_state.optimizer_state_dict)
+                logger.debug("Restored optimizer state (full mode)")
+
+            if training_state.lr_scheduler_state_dict is not None and self._lr_scheduler is not None:
+                self._lr_scheduler.load_state_dict(training_state.lr_scheduler_state_dict)
+                logger.debug("Restored LR scheduler state")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to restore training state: {e}. Starting from step 0.")
+            return False
+
+        rng = training_state.rng_states
+        if self._accelerator.num_processes > 1:
+            logger.debug("Skipping RNG restore in multi-process mode (only main process state was saved)")
+        else:
+            if rng.torch_state is not None:
+                torch.random.set_rng_state(rng.torch_state)
+            if rng.cuda_state is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng.cuda_state)
+            logger.debug("Restored RNG states")
+
+        return True
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
@@ -622,7 +766,6 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
-        # Add scheduler initialization
         lr_scheduler = self._create_scheduler(optimizer)
 
         # noinspection PyTypeChecker
@@ -655,8 +798,8 @@ class LtxvTrainer:
         elif scheduler_type == "cosine_with_restarts":
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=params.pop("T_0", steps // 4),  # First restart cycle length
-                T_mult=params.pop("T_mult", 1),  # Multiplicative factor for cycle lengths
+                T_0=params.pop("T_0", steps // 4),
+                T_mult=params.pop("T_mult", 1),
                 eta_min=params.pop("eta_min", 5e-5),
                 **params,
             )
@@ -832,7 +975,7 @@ class LtxvTrainer:
                         output_path=output_path,
                         fps=self._config.validation.frame_rate,
                         audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                        audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
                     )
                 video_paths.append(output_path)
 
@@ -911,9 +1054,11 @@ class LtxvTrainer:
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
 
-        # Keep track of checkpoint paths, and cleanup old checkpoints if needed
         self._checkpoint_paths.append(saved_weights_path)
         self._cleanup_checkpoints()
+
+        self._save_training_state(save_dir)
+
         return saved_weights_path
 
     def _cleanup_checkpoints(self) -> None:
@@ -923,9 +1068,87 @@ class LtxvTrainer:
             for old_checkpoint in checkpoints_to_remove:
                 if old_checkpoint.exists():
                     old_checkpoint.unlink()
-                    logger.info(f"Removed old checkpoints: {old_checkpoint}")
-            # Update the list to only contain kept checkpoints
+                    logger.info(f"Removed old checkpoint: {old_checkpoint}")
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
+
+    def _save_training_state(self, save_dir: Path) -> None:
+        """Save training state alongside checkpoint for resume.
+        Respects checkpoints.save_training_state config:
+        - "full": optimizer + scheduler + RNG + step
+        - "minimal": scheduler + RNG + step only
+        - "off": skip entirely
+        """
+        if not IS_MAIN_PROCESS:
+            return
+
+        mode = self._config.checkpoints.save_training_state
+        if mode == "off":
+            return
+
+        is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
+
+        optimizer_state = None
+        if mode == "full":
+            if is_fsdp:
+                logger.warning(
+                    "⚠️ save_training_state='full' is not supported with FSDP. "
+                    "Saving 'minimal' state (scheduler + RNG only)."
+                )
+            else:
+                optimizer_state = self._optimizer.state_dict()
+
+        state = TrainingState(
+            global_step=self._global_step,
+            config_fingerprint=ConfigFingerprint(
+                optimizer_type=self._config.optimization.optimizer_type,
+                scheduler_type=self._config.optimization.scheduler_type,
+                training_mode=self._config.model.training_mode,
+                lora_rank=self._config.lora.rank if self._config.lora is not None else None,
+            ),
+            rng_states=RngStates(
+                torch_state=torch.random.get_rng_state(),
+                cuda_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            ),
+            lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
+            optimizer_state_dict=optimizer_state,
+        )
+
+        state_path = save_dir / f"training_state_step_{self._global_step:05d}.pt"
+        tmp_path = state_path.with_suffix(".pt.tmp")
+        try:
+            torch.save(state.to_save_dict(), tmp_path)
+        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
+        tmp_path.rename(state_path)
+
+        file_size_gb = state_path.stat().st_size / (1024**3)
+        if file_size_gb > 1.0 and not self._training_state_size_warned:
+            self._training_state_size_warned = True
+            logger.warning(
+                f"⚠️ Training state file is {file_size_gb:.1f} GB (full mode includes optimizer state). "
+                f'Set checkpoints.save_training_state="minimal" to save only scheduler/RNG/step (~few KB), '
+                f'or "off" to disable entirely.'
+            )
+
+        if not self._training_state_paths or self._training_state_paths[-1] != state_path:
+            self._training_state_paths.append(state_path)
+        self._cleanup_training_states()
+
+        rel_path = state_path.relative_to(self._config.output_dir)
+        logger.debug(f"Training state saved to {rel_path}")
+
+    def _cleanup_training_states(self) -> None:
+        """Clean up old training state files, using the same keep_last_n as checkpoints."""
+        keep_n = self._config.checkpoints.keep_last_n
+        if 0 < keep_n < len(self._training_state_paths):
+            to_remove = self._training_state_paths[:-keep_n]
+            for old_state in to_remove:
+                if old_state.exists():
+                    old_state.unlink()
+                    logger.debug(f"Removed old training state: {old_state}")
+            self._training_state_paths = self._training_state_paths[-keep_n:]
 
     def _build_checkpoint_metadata(self) -> dict[str, str]:
         """Build metadata dictionary for safetensors checkpoint.
@@ -981,7 +1204,14 @@ class LtxvTrainer:
 
         # Determine if outputs are images or videos based on file extension
         is_image = sample_paths and sample_paths[0].suffix.lower() in (".png", ".jpg", ".jpeg", ".heic", ".webp")
-        media_cls = wandb.Image if is_image else wandb.Video
 
-        samples = [media_cls(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)]
+        if is_image:
+            samples = [
+                wandb.Image(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)
+            ]
+        else:
+            samples = [
+                wandb.Video(str(path), caption=prompt, format=path.suffix.lower().lstrip("."))
+                for path, prompt in zip(sample_paths, prompts, strict=True)
+            ]
         self._wandb_run.log({"validation_samples": samples}, step=self._global_step)
