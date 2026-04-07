@@ -1,6 +1,32 @@
+"""
+Run Example:
+# Run a pipeline (example: two-stage text-to-video)
+python -m ltx_pipelines/a2vid_two_stage.py \
+    --checkpoint-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2/ltx-2-19b-dev.safetensors \
+    --distilled-lora /root/autodl-tmp/huggingface/models/Lightricks--LTX-2/ltx-2-19b-distilled-lora-384.safetensors 0.8 \
+    --spatial-upsampler-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors \
+    --gemma-root /root/autodl-tmp/huggingface/models/google--gemma-3-12b-it-qat-q4_0-unquantized \
+    --audio-path /root/autodl-tmp/mjh_proj/MoChaBench-main/benchmark/audios/1p_closeup_facingcamera/1_man_guitar.wav \
+    --prompt "A close-up shot of a man singing and playing guitar in a recording studio, looking straight ahead, speaking to the camera. The background is blurred, revealing a black wall decorated with several playing cards, illuminated by a bright light shining from the right side. The man has deeply pigmented brown skin and short black hair. He is wearing a white and black checkered shirt and black headphones. He holds a silver guitar in his hands. As the video progresses, he speaks to the camera, his head and body move rhythmically, matching the tempo of the music. His expression remains deeply focused and emotionally engaged throughout the video. The camera is static, capturing his performance directly from the front." \
+    --image /root/autodl-tmp/mjh_proj/MoChaBench-main/benchmark/first-frames-from-mocha-generation/1p_closeup_facingcamera/1_man_guitar.png 0 0.8
+    --output-path /root/autodl-tmp/output.mp4
+
+# LTX 2.3
+    --checkpoint-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2.3/ltx-2.3-22b-dev.safetensors \
+    --distilled-lora /root/autodl-tmp/huggingface/models/Lightricks--LTX-2.3/ltx-2.3-22b-distilled-lora-384.safetensors 0.8 \
+    --spatial-upsampler-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2.3/ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
+    --output_dir /root/autodl-tmp/outputs/ltx2_3/MochaBenchMark \
+    
+
+# View all available options for any pipeline
+python -m ltx_pipelines.a2vid_two_stage --help
+"""
 import logging
+import math
+import sys
 from collections.abc import Iterator
 
+import av
 import torch
 
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -32,6 +58,32 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
 from ltx_pipelines.utils.types import ModalitySpec
+
+
+def _probe_audio_duration_seconds(path: str) -> float | None:
+    """Return audio duration in seconds from container metadata when available."""
+    container = av.open(path)
+    try:
+        audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+        if audio_stream is None:
+            return None
+
+        if audio_stream.duration is not None and audio_stream.time_base is not None:
+            return float(audio_stream.duration * audio_stream.time_base)
+
+        if container.duration is not None:
+            return float(container.duration / av.time_base)
+
+        return None
+    finally:
+        container.close()
+
+
+def _align_num_frames(duration_seconds: float, frame_rate: float) -> int:
+    """Convert duration to frame count and align to model requirement: num_frames = 8k + 1."""
+    raw_frames = max(1, math.ceil(duration_seconds * frame_rate))
+    # return ((raw_frames - 1 + 7) // 8) * 8 + 1
+    return ((raw_frames - 1) // 8) * 8 + 1
 
 
 class A2VidPipelineTwoStage:
@@ -123,6 +175,16 @@ class A2VidPipelineTwoStage:
         decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
         if decoded_audio is None:
             raise ValueError(f"Failed to decode audio from {audio_path}. Please check the file and try again.")
+
+        # mjh's modify
+        # Audio VAE checkpoints are trained for stereo input (2 channels).
+        # Adapt mono/multi-channel inputs to stereo to avoid channel mismatch at conv_in.
+        waveform = decoded_audio.waveform
+        if waveform.shape[1] == 1:
+            decoded_audio = Audio(waveform=waveform.repeat(1, 2, 1), sampling_rate=decoded_audio.sampling_rate)
+        elif waveform.shape[1] > 2:
+            decoded_audio = Audio(waveform=waveform[:, :2, :], sampling_rate=decoded_audio.sampling_rate)
+        #####
 
         encoded_audio_latent = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
@@ -253,6 +315,31 @@ def main() -> None:
         help="Maximum audio duration in seconds. Defaults to video duration (num_frames / frame_rate).",
     )
     args = parser.parse_args()
+
+    ## mjh's modify: auto-infer num_frames from audio duration when --num-frames is not explicitly provided, to avoid mismatch between video length and audio length which can cause quality degradation. Users can still specify --num-frames to override when needed.
+    explicit_num_frames = "--num-frames" in sys.argv
+    if not explicit_num_frames:
+        target_duration = args.audio_max_duration
+        if target_duration is None:
+            target_duration = _probe_audio_duration_seconds(args.audio_path)
+
+        if target_duration is not None and target_duration > 0:
+            inferred_num_frames = _align_num_frames(target_duration, args.frame_rate)
+            logging.info(
+                "\033[32m Auto num-frames enabled: \033[0m duration=%.3fs, fps=%.3f, inferred num_frames=%d",
+                target_duration,
+                args.frame_rate,
+                inferred_num_frames,
+            )
+            args.num_frames = inferred_num_frames
+        else:
+            logging.warning(
+                "\033[31m Auto num-frames failed to read audio duration from %s; using configured num_frames=%d \033[0m",
+                args.audio_path,
+                args.num_frames,
+            )
+    ###### mjh's modify ENDDING
+
     pipeline = A2VidPipelineTwoStage(
         checkpoint_path=args.checkpoint_path,
         distilled_lora=args.distilled_lora,
