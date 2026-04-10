@@ -1003,7 +1003,7 @@ def get_video_chunks_number(num_frames: int, tiling_config: TilingConfig | None 
     if not tiling_config or not tiling_config.temporal_config:
         return 1
     cfg = tiling_config.temporal_config
-    frame_stride = cfg.tile_size_in_frames - cfg.tile_overlap_in_frames
+    frame_stride = cfg.tile_size_in_frames - cfg.tile_overlap_in_frames     # 64-24=24
     return (num_frames - 1 + frame_stride - 1) // frame_stride
 
 

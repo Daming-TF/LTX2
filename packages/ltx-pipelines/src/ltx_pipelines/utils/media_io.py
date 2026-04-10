@@ -246,7 +246,7 @@ def encode_video(
 _INT_FORMAT_MAX: dict[str, float] = {
     "u8": 128.0,
     "u8p": 128.0,
-    "s16": 32768.0,
+    "s16": 32768.0,         # 带符号的16位整数，范围是[-32768, 32767]，所以除以32768可以将其映射到[-1, 1]的范围
     "s16p": 32768.0,
     "s32": 2147483648.0,
     "s32p": 2147483648.0,
@@ -257,12 +257,12 @@ def _audio_frame_to_float(frame: av.AudioFrame) -> np.ndarray:
     """Convert an audio frame to a float32 ndarray with values in [-1, 1] and shape (channels, samples)."""
     fmt = frame.format.name
     arr = frame.to_ndarray().astype(np.float32)
-    if fmt in _INT_FORMAT_MAX:
+    if fmt in _INT_FORMAT_MAX:          # 目的归一化
         arr = arr / _INT_FORMAT_MAX[fmt]
-    if not frame.format.is_planar:
+    if not frame.format.is_planar:      # 处理交错声道数据
         # Interleaved formats have shape (1, samples * channels) — reshape to (channels, samples).
         channels = len(frame.layout.channels)
-        arr = arr.reshape(-1, channels).T
+        arr = arr.reshape(-1, channels).T       # 当左右声道时输出形状为(2, samples)
     return arr
 
 
@@ -335,6 +335,7 @@ def decode_audio_from_file(
             break
         if first_frame_time is None:
             first_frame_time = frame_time
+        # Convert the audio frame into a numpy array with the shape of {number of channels, number of samples}
         samples.append(_audio_frame_to_float(frame))
 
     container.close()

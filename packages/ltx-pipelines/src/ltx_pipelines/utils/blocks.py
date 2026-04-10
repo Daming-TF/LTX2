@@ -377,7 +377,9 @@ class PromptEncoder:
 
         with gpu_model(
             self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-        ) as embeddings_processor:
+        ) as embeddings_processor:  # 临时构建针文本的connector，并在用完后自动清理显存
+            # hs为49层text的编码输出形状为{1,1024,3840}×49，mask为有用信息的掩码形状为{1,1024}
+            # connector对video Steam和audio Stream分别进行处理，两者的参数一致都是由Transformer Encoder构建
             return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
 
 

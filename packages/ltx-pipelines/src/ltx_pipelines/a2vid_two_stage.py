@@ -11,13 +11,16 @@ python -m ltx_pipelines/a2vid_two_stage.py \
     --image /root/autodl-tmp/mjh_proj/MoChaBench-main/benchmark/first-frames-from-mocha-generation/1p_closeup_facingcamera/1_man_guitar.png 0 0.8
     --output-path /root/autodl-tmp/output.mp4
 
-# LTX 2.3
+# NOTE: LTX 2.3 checkpoints path
     --checkpoint-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2.3/ltx-2.3-22b-dev.safetensors \
     --distilled-lora /root/autodl-tmp/huggingface/models/Lightricks--LTX-2.3/ltx-2.3-22b-distilled-lora-384.safetensors 0.8 \
     --spatial-upsampler-path /root/autodl-tmp/huggingface/models/Lightricks--LTX-2.3/ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
-    --output_dir /root/autodl-tmp/outputs/ltx2_3/MochaBenchMark \
     
 
+# NOTE: Optional param
+    --enhance-prompt        # 似乎是调用GemmaTextEncoder去针对文生图和图生图两个pipeline去增强prompt的文本编码，提升图像条件的利用率，尤其是当图像条件较弱时（比如单张图或者图像分辨率较低时）。可以尝试开启看看效果。
+    --audio_max_duration    # 支持的最大音频时长，若输入则截断后面多余音频
+    
 # View all available options for any pipeline
 python -m ltx_pipelines.a2vid_two_stage --help
 """
@@ -27,6 +30,7 @@ import sys
 from collections.abc import Iterator
 
 import av
+import pdb
 import torch
 
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -162,31 +166,36 @@ class A2VidPipelineTwoStage:
         noiser = GaussianNoiser(generator=generator)
         dtype = torch.bfloat16
 
+        # Encode prompts to get video and audio context for conditioning and guidance.
+        #   gemmaTextEncoder output:{1,1024,3840}
+        #   connector output: video context {1,1024,4096} and audio context {1,1024,2048}
         ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             streaming_prefetch_count=streaming_prefetch_count,
         )
-        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding   # {1,1024,4096} and {1,1024,2048}
         v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Encode audio.
+        #   waveform shape: (batch, channels, samples), values in [-1, 1]
         decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
         if decoded_audio is None:
             raise ValueError(f"Failed to decode audio from {audio_path}. Please check the file and try again.")
 
-        # mjh's modify
-        # Audio VAE checkpoints are trained for stereo input (2 channels).
-        # Adapt mono/multi-channel inputs to stereo to avoid channel mismatch at conv_in.
+        # mjh's modify: Uniform number of sound channels
+        #   Audio VAE checkpoints are trained for stereo input (2 channels).
+        #   Adapt mono/multi-channel inputs to stereo to avoid channel mismatch at conv_in.
         waveform = decoded_audio.waveform
         if waveform.shape[1] == 1:
             decoded_audio = Audio(waveform=waveform.repeat(1, 2, 1), sampling_rate=decoded_audio.sampling_rate)
         elif waveform.shape[1] > 2:
             decoded_audio = Audio(waveform=waveform[:, :2, :], sampling_rate=decoded_audio.sampling_rate)
+            logging.warning(f"\033[35m Input audio has {waveform.shape[1]} channels\033[0m: only the first 2 channels will be used for encoding.")
         #####
 
-        encoded_audio_latent = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
+        encoded_audio_latent = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))   # {batch, 8, frames//4, 16}
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
         encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
 
@@ -198,7 +207,7 @@ class A2VidPipelineTwoStage:
             width=width // 2,
             height=height // 2,
             fps=frame_rate,
-        )
+        )       # stage 1输出分辨率是目标分辨率的一半
         stage_1_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
                 images=images,
@@ -208,7 +217,7 @@ class A2VidPipelineTwoStage:
                 dtype=dtype,
                 device=self.device,
             )
-        )
+        )   # 用于关键帧Latent初始化以及后续每一步的图像条件引导，编码时会自动适配输入图像分辨率和输出分辨率     
 
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
 
@@ -379,6 +388,8 @@ def main() -> None:
         streaming_prefetch_count=args.streaming_prefetch_count,
         max_batch_size=args.max_batch_size,
     )
+
+    pdb.set_trace()  # For debugging: inspect 'video' and 'audio' variables before encoding.
 
     encode_video(
         video=video,

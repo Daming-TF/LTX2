@@ -37,7 +37,7 @@ class AudioProcessor(nn.Module):
         """Resample audio to the processor's target sample rate if needed."""
         if audio.sampling_rate == self.target_sample_rate:
             return audio
-        resampled = torchaudio.functional.resample(audio.waveform, audio.sampling_rate, self.target_sample_rate)
+        resampled = torchaudio.functional.resample(audio.waveform, audio.sampling_rate, self.target_sample_rate)    # target_sample_rate：16K
         resampled = resampled.to(device=audio.waveform.device, dtype=audio.waveform.dtype)
         return Audio(waveform=resampled, sampling_rate=self.target_sample_rate)
 
@@ -48,7 +48,7 @@ class AudioProcessor(nn.Module):
         """Convert waveform to log-mel spectrogram [batch, channels, time, n_mels]."""
         waveform = self.resample_audio(audio).waveform
 
-        mel = self.mel_transform(waveform)
+        mel = self.mel_transform(waveform)      # {batch, sound channels, samples} -> {batch, sound channels, mel bins:64, (samples+hop_length-1)//hop_length:160}
         mel = torch.log(torch.clamp(mel, min=1e-5))
 
         mel = mel.to(device=waveform.device, dtype=waveform.dtype)

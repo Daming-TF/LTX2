@@ -1,4 +1,5 @@
 from typing import Set, Tuple
+import pdb
 
 import torch
 import torch.nn.functional as F
@@ -267,9 +268,17 @@ def encode_audio(
             n_fft=audio_encoder.n_fft,
         ).to(device=device)
 
-    mel_spectrogram = audio_processor.waveform_to_mel(audio.to(device=device))
+    # {batch, sound channels, samples} -> {batch, sound channels, frames, mel bins}
+    #   frames: samples+hop_length-1)//hop_length   |   160
+    #   mel bins    |   64
+    mel_spectrogram = audio_processor.waveform_to_mel(audio.to(device=device))      
 
-    latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
+    # {batch, channels, frames, mel bins} -> {batch, latent channels, latent frames, latent mel bins}
+    #   latent channels   |   8
+    #   latent frames     |   frames//4
+    #   latent mel bins   |   16
+    latent = audio_encoder(mel_spectrogram.to(dtype=dtype))    
+     
     return latent
 
 
